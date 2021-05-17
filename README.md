@@ -1,6 +1,6 @@
-# shipdashbaord
+# shipdashboard
 
 Purpose:
-Demo dasboard using the {shiny.sematic} package.
+Demo dasboard using the **{shiny.sematic}** package.
 
 Shiny Modules
