@@ -1,0 +1,483 @@
+---
+title: "EDA and pre-processing of ships data"
+author: "Miguel Eersel"
+date: "14 May 2021"
+output: 
+  html_document:
+    code_folding: show
+    toc: TRUE
+    toc_float:
+      collapsed: FALSE 
+    theme: cerulean
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+   
+# Core packages -----
+library(tidyverse)
+library(lubridate)
+
+# data import
+library(vroom)
+
+# data manipulation
+library(data.table)
+library(tidyfast)
+
+# Helper packages
+library(fs)
+library(janitor)
+library(skimr)
+library(DataExplorer)
+library(here)
+
+# BSU packages
+library(tidyquant)
+library(timetk)
+
+# geospatial
+library(geodist)
+library(sf)
+
+# tables
+library(gt)
+library(reactable)
+library(reactablefmtr)
+
+
+```
+
+```{r function-get-distance}
+
+get_distance <-  function(df = df){
+  
+# Purpose: PAIRWISE calculation of distance
+  
+# The time-distance path of a ship is retrieved via the lon and lat variables.
+
+# INPUT: a dataframe of the travel route with datetime lon, lat observation per ship
+  
+  
+# Step 1: sort datetime in ascending order
+  df <-  df %>% 
+          arrange(datetime) %>% 
+# Step 2: retrieve tehe previous lon/lot geospatial datetime position    
+          mutate(lag_lat = lag(lat, 1),
+                 lag_lon = lag(lon, 1))
+          
+          
+          
+          
+df2 <-  df %>% 
+          drop_na(lag_lat)
+  
+lat1 <-  df2 %>% 
+          pull(lat)
+
+lat2 <-  df2 %>% 
+          pull(lag_lat)
+
+lon1 <-  df2 %>% 
+          pull(lon)
+
+lon2 <-  df2 %>% 
+          pull(lag_lon)
+
+# Step 3: calculate pairwise distances
+# distance between pairs {(lon1, lat1) and (lon2, lat2)}
+
+# result is stored in the dist_vec
+dist_vec <- geodist::geodist_vec(
+                     x1 = lon1,y1 = lat1,
+                     x2 = lon2, y2 = lat2,
+                     paired = TRUE, 
+                     measure = "haversine")
+
+# due to the lag() operation the first position is NA,. Replace NA with ZERO
+dist_vec <-  c(0,dist_vec)  
+  
+
+  
+  df_result <- df %>% 
+        mutate(
+           lag_datetime = dplyr::lag(datetime, n = 1),
+
+           # Calculate the   time difference between two (2) consecutive observations in unit hours          
+           traveltime_hours = lubridate::interval(start = lag_datetime,
+                                                  end = datetime) / lubridate::dhours(x = 1)
+        ) %>% 
+    
+       mutate(
+               diff_lat = (lat - lag_lat) %>%  round(5),
+               diff_lon  = (lon - lag_lon) %>%  round(5),
+
+              
+
+              consecutive_dist_m = round(dist_vec,digits = 0), # round distance to whole meters
+              
+              speed_meters_per_hour = consecutive_dist_m / traveltime_hours,
+               
+              speed_knots = (speed_meters_per_hour / 1852)
+              ) 
+    
+# return the result
+  return(df_result)
+}
+
+```
+
+```{r function-get-longest-distance}
+
+get_longest_distance <- function(df = df){
+
+# PURPOSE: Retrieve the longest path between two(2) consecutive observations 
+
+# INput: dataframe df with the distance between each consecutive observation (per ship)  
+    
+  df_calc <- df %>% 
+    
+# select longest distance    
+    slice_max(order_by = consecutive_dist_m,n = 1) %>% 
+    
+# select the most recent observation    
+    arrange(desc(datetime)) %>% 
+    slice(1)
+  
+  return(df_calc)
+  
+}
+
+
+```
+
+```{r read-ships-data}
+
+file_name_path <- here::here("00_data","ships.csv")
+
+
+# read the ship data and store it into ship_raw_tbl
+ships_raw_tbl <- vroom::vroom(file = file_name_path,
+                              col_types = cols()) %>% 
+                 janitor::clean_names() %>% 
+                 mutate(ship_id = as.character(ship_id),
+                        ship_id = stringr::str_squish(ship_id),
+                        shiptype = as.character(shiptype),
+                        lat = round(lat,5),
+                        lon = round(lon,5)
+                        ) %>% 
+                  
+                rename(ship_type_id = shiptype)
+
+```
+
+<br>
+
+------------------------------------------------------------------------
+
+## Data Cleaning steps
+
+The **ship_id** is a **unique** identifier for a ship name. A test is performed if this in indeed true. The findings are the shipname + shipptype combination is NOT unique.
+
+The following ship_id are NOT unique in combination with **shipname** and **ship_type**.
+
+------------------------------------------------------------------------
+
+```{r data-cleaning-steps}
+
+ships_raw_tbl %>% 
+  count(ship_id, shipname, ship_type, name="nr_obs") %>%  #  retrieve the unique combinations of ship_id and ship_names
+  add_count(ship_id, name = "ship_id_counts") %>%  # Count how many time a ship_id occurs. For a unique ship_id a ship_id value may only occur once.. Aad the counted value, n , as a new coloumn
+  filter(ship_id_counts > 1) %>% 
+  arrange(desc(ship_id_counts), ship_id,desc(nr_obs), shipname,ship_type) %>% 
+  gt::gt(groupname_col = "ship_id",
+         rownames_to_stub = TRUE,rowname_col = "shipname") %>% 
+  
+  
+  
+  gt::tab_style(style = list(cell_fill(color = "lightcyan")),
+                locations = cells_row_groups()) %>% 
+  
+  gt::tab_options(table.width = pct(100),
+                  table.font.size = px(11),
+                  column_labels.font.size = px(15), 
+                  column_labels.font.weight = "bold",) %>% 
+  
+  
+  gt::opt_row_striping()
+
+
+
+
+
+
+```
+
+------------------------------------------------------------------------
+
+For data cleaning of these non-unique ship_id, the website of [MarineTraffic AIS signal](https://www.marinetraffic.com/en/ais/home/centerx:-12.0/centery:25.0/zoom:4) has been used to investigate which **ship_id** corresponds with which **shipname** and **ship_type**.
+
+According to the information retrieved from this website the following cleaning of the non-unique ship_ids will be performed:
+
+| ship_id | shipname          | ship_type   |
+|---------|-------------------|-------------|
+| 4666609 | BLACKPEARL        | Unspecified |
+| 315731  | ODYS              | Tug         |
+| 315950  | WLA-311           | Fishing     |
+| 316404  | KAPITAN BORCHARDT | Pleasure    |
+| 316482  | WYSPA SZCZESCIA   | Pleasure    |
+| 345254  | IVAN KRUZENSHTERN | Tug         |
+| 347195  | GAZPROMNEFT WEST  | Tanker      |
+| 364937  | BOMAR MOON        | Cargo       |
+| 3653787 | ARGO              | Tug         |
+| 406999  | SEASTAR ENDURANCE | Cargo       |
+| 4190565 | OCEANOGRAF        | Tug         |
+| 757619  | PRINCE OF WAVES   | Cargo       |
+
+<br>
+
+For some ships , mainly of the tug boat type, no shipname was available. For these ships , the text **SAT-AIS** was registered as the shipname. In the data cleaning/data imputation steps the SAT-IS text was replaced by the unique SAT-IAS code of these ships.
+
+------------------------------------------------------------------------
+
+### **Calculation logic**
+
+As the **Shiny demo app** is an app with limited interactive calculations I have chosen to **pre-process** the raw (csv) data into its **semi-final data form** for the Shiny Dashboard.
+
+The main calculation logic is performed in this RMarkdown file which is a kind a **ETL** data pre-processor.
+
+Pairwise distance calculation\
+- function: get_distance \<- function(df = df)
+
+Longest distance between two consecutive observation\
+- function: get_longest_distance \<- function(df = df)
+
+------------------------------------------------------------------------
+
+### **Nested dataframe**
+
+For the purpose of code development and readability, **nested** data frames have been used to keep the (large) dataframe (approx. 3 million records with 1210 shipid) organized.
+
+**Nested** dataframes go hand-in-hand with the *map()* function.\
+All calculations per ship are performed via the *map()* function in combination with a *nested* dataframe.
+
+------------------------------------------------------------------------
+
+### **Distance calculation**
+
+A ***pairwise*** geo-spatial distance calculation method has been selected from the **{geodist}** package.
+
+Speed performance research\
+First the distance calculation function **st_distance()** from the **{sf}** package had been selected but the (speed) performance was not good. The **geodist_vec()** function of the {geodist} package is at least 5x times faster.
+
+------------------------------------------------------------------------
+
+### **Results**
+
+The results of the distance and other calculations have been stored in **rds files**. The input and output data files are stored in the **00_data** sub-folder.
+
+The rds files are the input data files for the Shiny Ships Dashboard application.
+
+------------------------------------------------------------------------
+
+### Shiny application
+
+The Shiny application is on `shinapps.io`
+
+\- Link to the app [AIS Ship Dashboard](https://miguel-eersel.shinyapps.io/shipdashboard)
+
+### Github repository
+
+The code of the app as well as this RMakrdown file can be found on my Public Github repository.
+
+\- Link to the Github repositoty [GitHub AIS Ship Dashboard](https://github.com/meersel/shipdashboard)
+
+-   The rds files as too larges to be uploaded to Github.
+
+    -   The rds output files can be created with this RMarkdown (ETL) file.
+
+```{r create-nested-ship-raw-tbl}
+
+ship_nested_raw_tbl <- ships_raw_tbl %>% 
+  group_nest(ship_id, shipname, ship_type)
+
+
+```
+
+```{r create-ship-nested-clean-tbl}
+
+ship_nested_clean_tbl <- ship_nested_raw_tbl %>% 
+
+  mutate(
+    shipname = case_when(
+    ship_id == "4666609" ~ "BLACKPEARL",
+    ship_id == "315731" ~ "ODYS",
+    ship_id == "315930" ~ "WLA-311",
+    ship_id == "315950" ~ "WLA-311",
+    ship_id == "316404" ~ "KAPITAN BORCHARDT",
+    ship_id == "347195" ~ "GAZPROMNEFT WEST",
+    ship_id == "364937" ~ "BOMAR MOON",
+    ship_id == "3653787" ~ "ARGO",
+    ship_id == "406999" ~ "SEASTAR ENDURANCE",
+    ship_id == "757619" ~ "PRINCE OF WAVES",
+    ship_id == "316482" ~ "WYSPA SZCZESCIA",
+    ship_id == "345254" ~ "IVAN KRUZENSHTERN",
+    
+    TRUE ~ shipname),
+
+# Ship OCEANOGRAF has two ship types. The "Tug" ship type is selected.        
+    ship_type = case_when(
+      ship_id == "4190565" ~ "Tug",
+      TRUE ~ ship_type),
+
+
+  ) %>%
+  
+  mutate(
+# For ships with the [SAS-AIS] as their ship name. the ship name will be replaced by the [SAS-AIS] number = ship_id        
+   shipname = case_when(
+     stringr::str_detect(shipname,"\\[SAT-AIS\\]") ~ ship_id,
+     TRUE ~ shipname),
+   shipname = case_when(
+     stringr::str_detect(shipname,"SAT AIS") ~ ship_id,
+     TRUE ~ shipname),
+   
+   
+   ) %>% 
+  
+  unnest(cols = data) %>%  
+  add_count(ship_id, shipname, ship_type, name = "nr_obs") %>% 
+  group_nest(ship_id,shipname, ship_type, nr_obs) 
+
+
+# add ship_id  to shapname in case that shipname+ship_type combination is not unique
+ship_nested_clean_tbl <- ship_nested_clean_tbl %>% 
+  add_count(shipname, ship_type, sort = TRUE) %>% 
+  arrange(desc(n), shipname) %>% 
+  mutate(shipname = case_when(
+    n > 1 ~ paste0(shipname,"-",ship_id),
+    TRUE ~ shipname
+  )) %>% 
+  select(-n)
+    
+
+
+ write_rds(x = ship_nested_clean_tbl,file = "00_data/ship_nested_clean_tbl.rds")
+
+ 
+ 
+ship_clean_tbl <- ship_nested_clean_tbl %>% 
+  unnest(data)
+
+ write_rds(x = ship_clean_tbl,file = "00_data/ship_clean_tbl.rds")
+ 
+
+```
+
+```{r calculate-distance-between-geopoints}
+
+ship_dist_tbl <-  ship_clean_tbl %>%
+   select(starts_with("ship"), lon, lat, speed, datetime, nr_obs) %>%
+  
+  group_nest(ship_id) %>% 
+#  filter(ship_id %in% c("1036966", "1037103")) %>% 
+    mutate(dist_nested_lst = purrr::map(.x = data,
+                                  .f = get_distance)) %>%
+  ungroup() %>% 
+  select(-data) %>% 
+  unnest(cols = dist_nested_lst)
+
+ship_dist_nested_tbl <-  ship_dist_tbl %>% 
+                          group_nest(ship_id, shipname, ship_type, nr_obs)
+  
+# store data a a nested dataframe
+write_rds(x = ship_dist_nested_tbl,file = "00_data/ship_dist_nested_tbl.rds")
+
+
+```
+
+```{r calculate-the-longest-distance-per-shipid}
+
+# Calculate the longest distance using teh fuction get_longest_distance()
+
+ship_longest_dist_tbl <- ship_dist_nested_tbl %>% 
+  mutate(longest_distance = map(data, .f=get_longest_distance)) %>% 
+  select(-data) %>% 
+  unnest(cols = longest_distance) %>% 
+  relocate(shipname, consecutive_dist_m)
+
+
+write_rds(ship_longest_dist_tbl,file = "00_data/ship_longest_dist_tbl.rds")
+
+```
+
+<br>
+
+------------------------------------------------------------------------
+
+### Basic Ship type analysis (counting)
+
+-   Dynamic sortable table **{reactable}**\
+-   Basic statistics about the **ship type**
+
+------------------------------------------------------------------------
+
+\`
+
+```{r dynamic-table-shiptype}
+
+
+
+ data <- ship_nested_clean_tbl %>% 
+  select(-data) %>% 
+  group_by(ship_type) %>% 
+   summarise(
+     tot_types = n(),
+     tot_obs   = sum(nr_obs)
+  ) %>% 
+  ungroup() %>% 
+  mutate(avg_obs = (tot_obs/tot_types) %>%  round(0))
+   
+  reactable::reactable(data = data,
+    columns = list(
+      avg_obs = colDef(align = "left",
+                       cell = reactablefmtr::data_bars(data,
+                                                       colors = "red",
+                                                       number_fmt = scales::comma_format(accuracy = 1))),
+      tot_types = colDef(align = "left",
+                       cell = reactablefmtr::data_bars(data,
+                                                       colors = "darkgreen",
+                                                       number_fmt = scales::comma_format(accuracy = 1))),
+    
+      tot_obs = colDef(align = "left",
+                       cell = reactablefmtr::data_bars(data, 
+                                                       colors = "dodgerblue",
+                                                       number_fmt = scales::comma_format(accuracy = 1)))
+    ),
+    sortable = TRUE
+    ) 
+  
+  
+
+
+
+
+```
+
+```{r dummy-chunck-for-testing, eval = FALSE}
+
+
+```
+
+<br>
+
+------------------------------------------------------------------------
+
+### Contact information:
+
+Author: Miguel Eersel
+
+e-mail: m.eersel\@outlook.com
+
+mobiel: +597-864 2328 (Suriname, GMT - 3 hours)
